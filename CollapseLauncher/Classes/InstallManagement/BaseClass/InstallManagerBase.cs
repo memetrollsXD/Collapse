@@ -1,5 +1,4 @@
 using CollapseLauncher.Interfaces;
-using CollapseLauncher.Statics;
 using Hi3Helper;
 using Hi3Helper.Data;
 using Hi3Helper.EncTool;
@@ -15,10 +14,10 @@ using System.Collections.Generic;
 using System.Data;
 using System.IO;
 using System.Linq;
-using System.Reflection.Metadata.Ecma335;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using static CollapseLauncher.Dialogs.SimpleDialogs;
@@ -28,8 +27,18 @@ using PatcherHDiff = Hi3Helper.SharpHDiffPatch;
 
 namespace CollapseLauncher.InstallManager.Base
 {
-    internal class InstallManagerBase<T> : ProgressBase<GameInstallPackageType, GameInstallPackage> where T : IGameVersionCheck
+    internal abstract class InstallManagerBase<T> : ProgressBase<GameInstallPackageType, GameInstallPackage> where T : IGameVersionCheck
     {
+        #region Internal Struct
+        protected struct UninstallGameProperty
+        {
+            public string gameDataFolderName;
+            public string[] filesToDelete;
+            public string[] foldersToDelete;
+            public string[] foldersToKeepInData;
+        }
+        #endregion
+
         #region Properties
         protected readonly string _gamePersistentFolderBasePath;
         protected readonly string _gameStreamingAssetsFolderBasePath;
@@ -54,6 +63,7 @@ namespace CollapseLauncher.InstallManager.Base
 
         #region Public Properties
         public bool IsRunning { get; protected set; }
+        public event EventHandler FlushingTrigger;
         #endregion
 
         public InstallManagerBase(UIElement parentUI, IGameVersionCheck GameVersionManager)
@@ -66,7 +76,15 @@ namespace CollapseLauncher.InstallManager.Base
             UpdateCompletenessStatus(CompletenessStatus.Idle);
         }
 
-        ~InstallManagerBase() => Dispose();
+        /*
+        ~InstallManagerBase()
+        {
+#if DEBUG
+            LogWriteLine($"[~InstallManagerBase()] Deconstructor getting called in {_gameVersionManager}", LogType.Warning, true);
+#endif
+            Dispose();
+        }
+        */
 
         protected void ResetToken() => _token = new CancellationTokenSource();
 
@@ -81,9 +99,10 @@ namespace CollapseLauncher.InstallManager.Base
 
         public virtual void Flush()
         {
+            UpdateCompletenessStatus(CompletenessStatus.Idle);
             _gameRepairTool?.Dispose();
             _assetIndex.Clear();
-            UpdateCompletenessStatus(CompletenessStatus.Idle);
+            FlushingTrigger?.Invoke(this, EventArgs.Empty);
         }
 
         #region Public Methods
@@ -445,10 +464,8 @@ namespace CollapseLauncher.InstallManager.Base
                         // Check if the read stream exist
                         if (segment.IsReadStreamExist(_downloadThreadCount))
                         {
-                            // Get the stream of the segment and using (and auto dispose) it
-                            using Stream segmentStream = segment.GetReadStream(_downloadThreadCount);
-                            // Return the size/length of the stream
-                            return segmentStream.Length;
+                            // Return the size/length of the chunk stream
+                            return segment.GetStreamLength(_downloadThreadCount);
                         }
                         // If not, then return 0
                         return 0;
@@ -458,10 +475,8 @@ namespace CollapseLauncher.InstallManager.Base
                 // If segment is none, check if the single stream exist
                 if (asset.IsReadStreamExist(_downloadThreadCount))
                 {
-                    // If yes, then using single stream
-                    using Stream singleStream = asset.GetReadStream(_downloadThreadCount);
-                    // Return the size of the stream
-                    return singleStream.Length;
+                    // If yes, then return the size of the single stream
+                    return asset.GetStreamLength(_downloadThreadCount);
                 }
 
                 // If neither of both exist, then return 0
@@ -480,24 +495,143 @@ namespace CollapseLauncher.InstallManager.Base
 
         public async ValueTask<bool> UninstallGame()
         {
+            // Get the Game folder
             string GameFolder = ConverterTool.NormalizePath(_gamePath);
 
-            switch (await Dialog_UninstallGame(_parentUI, GameFolder, _gameVersionManager.GamePreset.ZoneFullname))
+            // Check if the dialog result is Okay (Primary). If not, then return false
+            ContentDialogResult DialogResult = await Dialog_UninstallGame(_parentUI, GameFolder, _gameVersionManager.GamePreset.ZoneFullname);
+            if (DialogResult != ContentDialogResult.Primary) return false;
+
+            try
             {
-                case ContentDialogResult.Primary:
+                // Assign UninstallProperty from each overrides
+                UninstallGameProperty UninstallProperty = AssignUninstallFolders();
+
+                //Preparing paths
+                var _DataFolderFullPath = Path.Combine(GameFolder, UninstallProperty.gameDataFolderName);
+
+                var foldersToKeepInDataFullPath = new string[UninstallProperty.foldersToKeepInData.Length]; // Just in case mhy put more not-to-be-deleted folders in _Data
+                for (int i = 0; i < UninstallProperty.foldersToKeepInData.Length; i++) // yes i'm still salty about it
+                {
+                    foldersToKeepInDataFullPath[i] = Path.Combine(_DataFolderFullPath, UninstallProperty.foldersToKeepInData[i]);
+                }
+
+                LogWriteLine($"Uninstalling game: {_gameVersionManager.GameType} - region: {_gameVersionManager.GamePreset.ZoneName}\r\n" +
+                    $"  GameFolder          : {GameFolder}\r\n" +
+                    $"  gameDataFolderName  : {UninstallProperty.gameDataFolderName}\r\n" +
+                    $"  foldersToDelete     : {string.Join(", ", UninstallProperty.foldersToDelete)}\r\n" +
+                    $"  filesToDelete       : {string.Join(", ", UninstallProperty.filesToDelete)}\r\n" +
+                    $"  foldersToKeepInData : {string.Join(", ", UninstallProperty.foldersToKeepInData)}\r\n" +
+                    $"  _Data folder path   : {_DataFolderFullPath}\r\n" +
+                    $"  Excluded full paths : {string.Join(", ", foldersToKeepInDataFullPath)}", LogType.Warning, true);
+
+                // Cleanup Game_Data folder while keeping whatever specified in foldersToKeepInData
+                foreach (string folderGameData in Directory.EnumerateFileSystemEntries(_DataFolderFullPath))
+                {
                     try
                     {
-                        Directory.Delete(GameFolder, true);
+                        if (UninstallProperty.foldersToKeepInData.Length != 0 && !foldersToKeepInDataFullPath.Contains(folderGameData)) // Skip this entire process if foldersToKeepInData is null
+                        {
+                            // Delete directories inside gameDataFolderName that is not included in foldersToKeepInData
+                            if (File.GetAttributes(folderGameData).HasFlag(FileAttributes.Directory))
+                            {
+                                Directory.Delete(folderGameData, true);
+                                LogWriteLine($"Deleted folder: {folderGameData}", LogType.Default, true);
+                            }
+                            // Delete files inside gameDataFolderName that is not included in foldersToKeepInData
+                            else
+                            {
+                                File.Delete(folderGameData);
+                                LogWriteLine($"Deleted file: {folderGameData}", LogType.Default, true);
+                            }
+                            continue;
+                        }
                     }
                     catch (Exception ex)
                     {
-                        LogWriteLine($"Failed while deleting the game folder: {GameFolder}\r\n{ex}", LogType.Error, true);
+                        LogWriteLine($"An error occurred while deleting object {folderGameData}\r\n{ex}", LogType.Error, true);
                     }
-                    _gameVersionManager.Reinitialize();
-                    return true;
-                default:
-                    return false;
+                }
+                // Check if _DataFolderPath folder empty after cleaning up 
+                if (!Directory.EnumerateFileSystemEntries(_DataFolderFullPath).Any())
+                {
+                    Directory.Delete(_DataFolderFullPath);
+                    LogWriteLine($"Deleted empty game folder: {_DataFolderFullPath}", LogType.Default, true);
+                }
+
+                // Cleanup any folders in foldersToDelete
+                foreach (string folderNames in Directory.EnumerateDirectories(GameFolder))
+                {
+                    if (UninstallProperty.foldersToDelete.Length != 0 && UninstallProperty.foldersToDelete.Contains(Path.GetFileName(folderNames)))
+                    {
+                        try
+                        {
+                            Directory.Delete(folderNames, true);
+                            LogWriteLine($"Deleted {folderNames}", LogType.Default, true);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogWriteLine($"An error occurred while deleting folder {folderNames}\r\n{ex}", LogType.Error, true);
+                        }
+                        continue;
+                    }
+                }
+
+                // Cleanup any files in filesToDelete
+                foreach (string fileNames in Directory.EnumerateFiles(GameFolder))
+                {
+                    if (UninstallProperty.filesToDelete.Length != 0 && UninstallProperty.filesToDelete.Contains(Path.GetFileName(fileNames)) ||
+                        UninstallProperty.filesToDelete.Length != 0 && UninstallProperty.filesToDelete.Any(pattern => Regex.IsMatch(Path.GetFileName(fileNames), pattern, RegexOptions.Compiled | RegexOptions.NonBacktracking)))
+                    {
+                        try
+                        {
+                            File.Delete(fileNames);
+                            LogWriteLine($"Deleted {fileNames}", LogType.Default, true);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogWriteLine($"An error occurred while deleting file {fileNames}\r\n{ex}", LogType.Error, true);
+                        }
+                        continue;
+                    }
+                }
+
+                // Cleanup Game App Data
+                string appDataPath = _gameVersionManager.GameDirAppDataPath;
+                try
+                {
+                    Directory.Delete(appDataPath, true);
+                    LogWriteLine($"Deleted {appDataPath}", LogType.Default, true);
+                }
+                catch (Exception ex)
+                {
+                    LogWriteLine($"An error occurred while deleting game AppData folder: {_gameVersionManager.GameDirAppDataPath}\r\n{ex}", LogType.Error, true);
+                }
+
+                // Remove the entire folder if nothing is there
+                if (Directory.Exists(GameFolder) && !Directory.EnumerateFileSystemEntries(GameFolder).Any())
+                {
+                    try
+                    {
+                        Directory.Delete(GameFolder);
+                        LogWriteLine($"Deleted empty game folder: {GameFolder}", LogType.Default, true);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogWriteLine($"An error occurred while deleting empty game folder: {GameFolder}\r\n{ex}", LogType.Error, true);
+                    }
+                }
+                else
+                {
+                    LogWriteLine($"Game folder {GameFolder} is not empty, skipping delete root directory...", LogType.Default, true);
+                }
             }
+            catch (Exception ex)
+            {
+                LogWriteLine($"Failed while uninstalling game: {_gameVersionManager.GameType} - region: {_gameVersionManager.GamePreset.ZoneName}\r\n{ex}", LogType.Error, true);
+            }
+            _gameVersionManager.Reinitialize();
+            return true;
         }
 
         public void CancelRoutine()
@@ -595,7 +729,7 @@ namespace CollapseLauncher.InstallManager.Base
                         await Task.Run(() =>
                         {
                             patcher.Initialize(patchPath);
-                            patcher.Patch(sourceBasePath, destPath, false, _token.Token);
+                            patcher.Patch(sourceBasePath, destPath, true, _token.Token);
                         }, _token.Token);
 
                         File.Move(destPath, sourceBasePath, true);
@@ -1231,6 +1365,9 @@ namespace CollapseLauncher.InstallManager.Base
                     _status.IsRunning = false;
                     _status.IsCompleted = true;
                     _status.IsCanceled = false;
+                    // HACK: Fix the progress not achieving 100% while completed
+                    _progress.ProgressTotalPercentage = 100f;
+                    _progress.ProgressPerFilePercentage = 100f;
                     break;
                 case CompletenessStatus.Cancelled:
                     IsRunning = false;
@@ -1245,7 +1382,7 @@ namespace CollapseLauncher.InstallManager.Base
                     _status.IsCanceled = false;
                     break;
             }
-            UpdateStatus();
+            UpdateAll();
         }
 
         protected async Task TryGetPackageRemoteSize(GameInstallPackage asset, CancellationToken token)
@@ -1269,6 +1406,10 @@ namespace CollapseLauncher.InstallManager.Base
             asset.Size = totalSize;
             LogWriteLine($"Package Segment (count: {asset.Segments.Count}) has {ConverterTool.SummarizeSizeSimple(asset.Size)} in total size with {ConverterTool.SummarizeSizeSimple(asset.SizeRequired)} of free space required", LogType.Default, true);
         }
+        #endregion
+
+        #region Virtual Methods - UninstallGame
+        protected virtual UninstallGameProperty AssignUninstallFolders() => throw new NotSupportedException($"Cannot uninstall game: {_gameVersionManager.GamePreset.GameType}. Uninstall method is not yet implemented!");
         #endregion
 
         #region Event Methods
